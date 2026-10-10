@@ -1,0 +1,116 @@
+name: Build & Package
+
+# Builds a complete production package (Next.js standalone + static assets +
+# public files) on every branch, and uploads it as a downloadable zip artifact.
+# Tagged releases are handled separately by release.yml.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Lint, typecheck, build, package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: "npm"
+
+      - name: Compute safe package name
+        run: |
+          set -euo pipefail
+          SAFE_NAME="$(printf '%s' "${GITHUB_REF_NAME}" | tr '/' '-' | tr -c 'A-Za-z0-9._-' '-')"
+          [ -n "$SAFE_NAME" ] || SAFE_NAME="build"
+          echo "SAFE_NAME=$SAFE_NAME" >> "$GITHUB_ENV"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Build (Next.js standalone)
+        run: npm run build
+
+      - name: Assemble deployment package
+        run: |
+          set -euo pipefail
+          PKG="tele-bucket-package"
+          rm -rf "$PKG"
+          mkdir -p "$PKG"
+
+          # Next.js standalone server (includes its own minimal node_modules).
+          cp -R .next/standalone/. "$PKG/"
+
+          # Never ship the local index/session or env files. A local build can
+          # trace `.data/` (it holds the saved MTProto session) into standalone.
+          rm -rf "$PKG/.data"
+          rm -f "$PKG/.env" "$PKG/.env.local" "$PKG/.env.production"
+
+          # Static assets and public files are not traced into standalone.
+          mkdir -p "$PKG/.next/static"
+          cp -R .next/static/. "$PKG/.next/static/"
+          if [ -d public ]; then
+            mkdir -p "$PKG/public"
+            cp -R public/. "$PKG/public/"
+          fi
+
+          # Helper files for deploying.
+          [ -f .env.local.example ] && cp .env.local.example "$PKG/.env.local.example"
+          [ -f README.md ] && cp README.md "$PKG/README.md"
+
+          cat > "$PKG/DEPLOY.md" <<'EOF'
+          # tele-bucket deployment package
+
+          This folder is a self-contained Next.js standalone production build.
+
+          ## Run
+
+          Requires Node.js 24+ (uses the built-in `node:sqlite`).
+
+              node server.js
+
+          The server listens on `PORT` (default 3000) and `HOSTNAME`
+          (default 0.0.0.0). Example:
+
+              PORT=8080 node server.js
+
+          ## Configure
+
+          Either sign in through the UI (credentials and the session are stored
+          in `.data/telebucket.db` next to the process), or set environment
+          variables before starting:
+
+              TELEGRAM_API_ID=...
+              TELEGRAM_API_HASH=...
+              TELEGRAM_PHONE=...
+              TELEGRAM_SESSION=...   # optional, skips code login
+
+          Files are stored in private Telegram channels ("shared drives");
+          `.data/` holds only local metadata and stays on this machine.
+          EOF
+
+      - name: Upload deployment package
+        uses: actions/upload-artifact@v4
+        with:
+          name: tele-bucket-package-${{ env.SAFE_NAME }}
+          # Upload the assembled folder as-is; upload-artifact zips it for us.
+          # Hidden entries (.next/, .env.local.example) must be included or the
+          # package would be incomplete.
+          path: tele-bucket-package
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 30
