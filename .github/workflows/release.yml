@@ -1,0 +1,117 @@
+name: Release
+
+# Whenever a tag is created, build the complete production package and publish
+# it as a GitHub Release with the deployment zip attached.
+on:
+  push:
+    tags: ["*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build package and publish release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: "npm"
+
+      - name: Compute safe package name
+        run: |
+          set -euo pipefail
+          SAFE_NAME="$(printf '%s' "${GITHUB_REF_NAME}" | tr '/' '-' | tr -c 'A-Za-z0-9._-' '-')"
+          [ -n "$SAFE_NAME" ] || SAFE_NAME="release"
+          echo "SAFE_NAME=$SAFE_NAME" >> "$GITHUB_ENV"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Build (Next.js standalone)
+        run: npm run build
+
+      - name: Assemble deployment package
+        run: |
+          set -euo pipefail
+          PKG="tele-bucket-package"
+          rm -rf "$PKG"
+          mkdir -p "$PKG"
+
+          cp -R .next/standalone/. "$PKG/"
+
+          # Never ship the local index/session or env files. A local build can
+          # trace `.data/` (it holds the saved MTProto session) into standalone.
+          rm -rf "$PKG/.data"
+          rm -f "$PKG/.env" "$PKG/.env.local" "$PKG/.env.production"
+
+          mkdir -p "$PKG/.next/static"
+          cp -R .next/static/. "$PKG/.next/static/"
+          if [ -d public ]; then
+            mkdir -p "$PKG/public"
+            cp -R public/. "$PKG/public/"
+          fi
+
+          [ -f .env.local.example ] && cp .env.local.example "$PKG/.env.local.example"
+          [ -f README.md ] && cp README.md "$PKG/README.md"
+
+          cat > "$PKG/DEPLOY.md" <<'EOF'
+          # tele-bucket deployment package
+
+          This folder is a self-contained Next.js standalone production build.
+
+          ## Run
+
+          Requires Node.js 24+ (uses the built-in `node:sqlite`).
+
+              node server.js
+
+          The server listens on `PORT` (default 3000) and `HOSTNAME`
+          (default 0.0.0.0). Example:
+
+              PORT=8080 node server.js
+
+          ## Configure
+
+          Either sign in through the UI (credentials and the session are stored
+          in `.data/telebucket.db` next to the process), or set environment
+          variables before starting:
+
+              TELEGRAM_API_ID=...
+              TELEGRAM_API_HASH=...
+              TELEGRAM_PHONE=...
+              TELEGRAM_SESSION=...   # optional, skips code login
+
+          Files are stored in private Telegram channels ("shared drives");
+          `.data/` holds only local metadata and stays on this machine.
+          EOF
+
+      - name: Create zip
+        run: |
+          set -euo pipefail
+          # Zip the package contents at the archive root (hidden files included),
+          # matching the artifact structure produced by build.yml. Release assets
+          # need an actual zip file, so this step is required here.
+          cd tele-bucket-package
+          zip -r "../tele-bucket-${SAFE_NAME}.zip" .
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" "tele-bucket-${SAFE_NAME}.zip" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes
